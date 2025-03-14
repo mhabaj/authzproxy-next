@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 
 	"authzproxy/internal/auth"
+	"authzproxy/internal/contextutil"
 	"authzproxy/internal/observability/logging"
 	"authzproxy/internal/tls"
 )
@@ -104,85 +104,73 @@ func (a *Authenticator) GetMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Skip if TLS is not enabled or no client certificates are presented
-		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			logger.Debug("No TLS or no client certificates")
+		if r.TLS == nil {
+			logger.Debug("No TLS connection")
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// First, check all peer certificates
-		logger.Debug("Checking peer certificates")
-		for _, elem := range r.TLS.PeerCertificates {
-			opts := x509.VerifyOptions{
-				Roots:         a.authCAs,
-				CurrentTime:   time.Now(),
-				Intermediates: x509.NewCertPool(), // Important for chain building
-				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-			}
+		// If client presented certificates, we must validate them
+		// If validation fails, do not fall back to other methods
+		if len(r.TLS.PeerCertificates) > 0 {
+			logger.Debug("Checking peer certificates")
 
-			if _, err := elem.Verify(opts); err != nil {
-				logger.Error("Client certificate verification failed", logging.Err(err))
-				http.Error(w, "Client certificate verification failed", http.StatusUnauthorized)
-				return
-			}
-		}
-
-		logger.Debug("Starting mTLS client authentication")
-
-		// Check if a client certificate is in the verified chains
-		if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-			// Get the common name from the certificate
-			commonName := r.TLS.VerifiedChains[0][0].Subject.CommonName
-
-			// Use DNS names only in development mode and if CN is empty
-			if commonName == "" {
-				if os.Getenv("ENVIRONMENT") == "development" && len(r.TLS.VerifiedChains[0][0].DNSNames) > 0 {
-					commonName = r.TLS.VerifiedChains[0][0].DNSNames[0]
-					logger.Debug("Using DNS name as subject", "dnsName", commonName)
+			// First, validate each certificate in the chain
+			for _, cert := range r.TLS.PeerCertificates {
+				if err := tls.VerifyCertificate(cert, a.authCAs, logger); err != nil {
+					logger.Error("Client certificate verification failed", logging.Err(err))
+					http.Error(w, "Client certificate verification failed", http.StatusUnauthorized)
+					return // Do not fall back if validation fails
 				}
+			}
 
-				// Reject if still empty
+			logger.Debug("Starting mTLS client authentication")
+
+			// Now check if the certificate is in the verified chains (which means it was successfully validated)
+			if len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+				// Get the common name from the certificate
+				commonName := r.TLS.VerifiedChains[0][0].Subject.CommonName
+
+				// Use DNS names only in development mode and if CN is empty
 				if commonName == "" {
-					err := fmt.Errorf("certificate Common Name is nil")
-					logger.Error("mTLS Client certificate verification failed", logging.Err(err))
-					http.Error(w, "Client certificate verification failed, commonName is nil", http.StatusUnauthorized)
-					return
+					if os.Getenv("ENVIRONMENT") == "development" && len(r.TLS.VerifiedChains[0][0].DNSNames) > 0 {
+						commonName = r.TLS.VerifiedChains[0][0].DNSNames[0]
+						logger.Debug("Using DNS name as subject", "dnsName", commonName)
+					}
+
+					// Reject if still empty
+					if commonName == "" {
+						err := fmt.Errorf("certificate Common Name is nil")
+						logger.Error("mTLS Client certificate verification failed", logging.Err(err))
+						http.Error(w, "Client certificate verification failed, commonName is nil", http.StatusUnauthorized)
+						return
+					}
 				}
-			}
 
-			// Validate the client certificate with explicit options
-			opts := x509.VerifyOptions{
-				Roots:         a.authCAs,
-				CurrentTime:   time.Now(),
-				Intermediates: x509.NewCertPool(),
-				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-			}
+				logger.Debug("Client certificate verified successfully", "commonName", commonName)
 
-			_, err := r.TLS.VerifiedChains[0][0].Verify(opts)
-			if err != nil {
-				logger.Error("Client certificate verification failed", logging.Err(err))
-				http.Error(w, "Client certificate verification failed", http.StatusUnauthorized)
+				// Create identity
+				identity := &auth.Identity{
+					Subject:  commonName,
+					Provider: a.Name(),
+					Attributes: map[string]interface{}{
+						"certificate": r.TLS.VerifiedChains[0][0],
+					},
+				}
+
+				// Add identity and auth type to request context
+				ctx = contextutil.WithIdentity(ctx, identity)
+				ctx = contextutil.WithAuthType(ctx, auth.AuthTypeMTLS)
+
+				logger.Debug("mTLS authentication successful", "subject", commonName)
+			} else {
+				logger.Warn("No verified client certificate chains")
+				// We had certificates but they weren't properly verified
+				http.Error(w, "Invalid client certificate", http.StatusUnauthorized)
 				return
 			}
-
-			logger.Debug("Client certificate verified successfully", "commonName", commonName)
-
-			// Create identity
-			identity := &auth.Identity{
-				Subject:  commonName,
-				Provider: a.Name(),
-				Attributes: map[string]interface{}{
-					"certificate": r.TLS.VerifiedChains[0][0],
-				},
-			}
-
-			// Add identity and auth type to request context
-			ctx = auth.ContextWithIdentity(ctx, identity)
-			ctx = auth.ContextWithAuthType(ctx, auth.AuthTypeMTLS)
-
-			logger.Debug("mTLS authentication successful", "subject", commonName)
 		} else {
-			logger.Warn("No verified client certificate chains")
+			logger.Debug("No client certificates presented")
 		}
 
 		// Continue with the next handler

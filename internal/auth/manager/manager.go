@@ -31,12 +31,10 @@ func NewManager(authenticators []auth.Authenticator, logger *logging.Logger) *Ma
 
 // Middleware creates a middleware chain from all enabled authenticators
 func (m *Manager) Middleware(next http.Handler) http.Handler {
-	// Apply authenticators in reverse order
-	// This ensures that the first authenticator in the list is the outermost middleware
-	// Order is important: mTLS, then Bearer, then OIDC
+	// Apply authenticators in the correct order (not in reverse)
+	// This ensures that mTLS is checked first, then Bearer, then OIDC
 	handler := next
-	for i := len(m.authenticators) - 1; i >= 0; i-- {
-		authenticator := m.authenticators[i]
+	for _, authenticator := range m.authenticators {
 		handler = authenticator.GetMiddleware(handler)
 		m.logger.Debug("Added authenticator to middleware chain", "authenticator", authenticator.Name())
 	}

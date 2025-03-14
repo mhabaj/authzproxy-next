@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
 // Load loads the configuration from all sources and returns the merged result
@@ -100,8 +102,28 @@ func Load(configPath string) (*Config, error) {
 	config.Observability.LogLevel = v.GetString("LOG_LEVEL")
 	config.Observability.LogFormat = v.GetString("LOG_FORMAT")
 
-	// Rules will be loaded from a separate function
-	// config.Rules = loadRules(v)
+	// Check if there's a rules path specified
+	rulesPath := v.GetString("RULES_PATH")
+	if rulesPath != "" {
+		// Load rules from file
+		rules, err := LoadRules(rulesPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load rules from file: %w", err)
+		}
+		config.Rules = rules
+	} else {
+		// Load rules from the Viper config (YAML in string)
+		rulesYAML := v.GetString("RULES")
+		if rulesYAML != "" {
+			var rulesList struct {
+				Rules []Rule `yaml:"rules"`
+			}
+			if err := yaml.Unmarshal([]byte(rulesYAML), &rulesList); err != nil {
+				return nil, fmt.Errorf("failed to parse rules from config: %w", err)
+			}
+			config.Rules = rulesList.Rules
+		}
+	}
 
 	// Validate the configuration
 	if err := validateConfig(config); err != nil {
@@ -109,6 +131,46 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	return config, nil
+}
+
+// LoadRules loads routing rules from a file
+func LoadRules(rulesPath string) ([]Rule, error) {
+	// Check if the file exists
+	if _, err := os.Stat(rulesPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("rules file not found: %s", rulesPath)
+	}
+
+	// Read the file
+	data, err := os.ReadFile(rulesPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rules file: %w", err)
+	}
+
+	// Parse the rules based on the file extension
+	var rules struct {
+		Rules []Rule `yaml:"rules" json:"rules"`
+	}
+
+	// Determine the format based on file extension
+	switch {
+	case strings.HasSuffix(rulesPath, ".yaml"), strings.HasSuffix(rulesPath, ".yml"):
+		if err := yaml.Unmarshal(data, &rules); err != nil {
+			return nil, fmt.Errorf("failed to parse YAML rules: %w", err)
+		}
+	case strings.HasSuffix(rulesPath, ".json"):
+		if err := json.Unmarshal(data, &rules); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON rules: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported rules file format, use .yaml, .yml, or .json")
+	}
+
+	// Validate the rules
+	if err := validateRules(rules.Rules); err != nil {
+		return nil, err
+	}
+
+	return rules.Rules, nil
 }
 
 // validateConfig performs validation on the loaded configuration
@@ -143,6 +205,11 @@ func validateConfig(cfg *Config) error {
 
 	// Validate authorization configurations
 	if err := validateAuthzConfig(cfg); err != nil {
+		return err
+	}
+
+	// Validate rules
+	if err := validateRules(cfg.Rules); err != nil {
 		return err
 	}
 
@@ -207,13 +274,85 @@ func validateAuthzConfig(cfg *Config) error {
 		if cfg.Authz.SpiceDB.ResourceID == "" {
 			return fmt.Errorf("SpiceDB resource ID is required when using SpiceDB authorization")
 		}
+		if cfg.Authz.SpiceDB.ResourceType == "" {
+			return fmt.Errorf("SpiceDB resource type is required when using SpiceDB authorization")
+		}
+		if cfg.Authz.SpiceDB.SubjectType == "" {
+			return fmt.Errorf("SpiceDB subject type is required when using SpiceDB authorization")
+		}
 	}
 
 	return nil
 }
 
-// LoadRules loads routing rules from a file
-func LoadRules(rulesPath string) ([]Rule, error) {
-	// This will be implemented later
-	return nil, nil
+// validateRules validates the routing rules
+func validateRules(rules []Rule) error {
+	// Check if rules are empty
+	if len(rules) == 0 {
+		return fmt.Errorf("no rules defined")
+	}
+
+	// Check each rule for validity
+	for i, rule := range rules {
+		// Check required fields
+		if rule.Name == "" {
+			return fmt.Errorf("rule at index %d has no name", i)
+		}
+
+		if len(rule.Paths) == 0 {
+			return fmt.Errorf("rule '%s' has no paths", rule.Name)
+		}
+
+		// Check action is valid
+		switch rule.Action {
+		case "allow", "deny", "auth":
+			// Valid action
+		default:
+			return fmt.Errorf("rule '%s' has invalid action: %s, must be 'allow', 'deny', or 'auth'", rule.Name, rule.Action)
+		}
+
+		// If action is 'auth', check that permission is set
+		if rule.Action == "auth" && rule.Permission == "" {
+			return fmt.Errorf("rule '%s' has 'auth' action but no permission", rule.Name)
+		}
+	}
+
+	// Check for conflicts and redundancy
+	pathMethodActionMap := make(map[string]string)
+	for _, rule := range rules {
+		for _, path := range rule.Paths {
+			key := path
+			if rule.MatchPrefix {
+				key = "prefix:" + path
+			}
+
+			// If methods are specified, check each method
+			if len(rule.Methods) > 0 {
+				for _, method := range rule.Methods {
+					methodKey := key + ":" + method
+					if existingAction, exists := pathMethodActionMap[methodKey]; exists {
+						if existingAction != rule.Action {
+							return fmt.Errorf("conflicting rules for path '%s' with method '%s': actions '%s' and '%s'",
+								path, method, existingAction, rule.Action)
+						}
+						// This is redundant but not an error
+						// We could add a warning here if we had a way to emit warnings
+					}
+					pathMethodActionMap[methodKey] = rule.Action
+				}
+			} else {
+				// If no methods are specified, the rule applies to all methods
+				if existingAction, exists := pathMethodActionMap[key]; exists {
+					if existingAction != rule.Action {
+						return fmt.Errorf("conflicting rules for path '%s': actions '%s' and '%s'",
+							path, existingAction, rule.Action)
+					}
+					// Redundant rule
+				}
+				pathMethodActionMap[key] = rule.Action
+			}
+		}
+	}
+
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"authzproxy/internal/auth"
+	"authzproxy/internal/contextutil"
 	"authzproxy/internal/observability/logging"
 	"authzproxy/internal/observability/metrics"
 
@@ -130,7 +131,7 @@ func (a *Authenticator) GetMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Check if we already have an identity in the context
-		if identity := auth.IdentityFromContext(ctx); identity != nil {
+		if identity := contextutil.GetIdentity(ctx); identity != nil {
 			logger.Debug("Skipping Bearer: identity already set", "subject", identity.Subject)
 			next.ServeHTTP(w, r)
 			return
@@ -145,7 +146,8 @@ func (a *Authenticator) GetMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Extract the token
+		// Extract the token - if client presented a Bearer token, we must validate it
+		// If validation fails, do not fall back to other methods
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 		if tokenStr == "" {
 			logger.Debug("Empty Bearer token, passing to next middleware")
@@ -205,8 +207,8 @@ func (a *Authenticator) GetMiddleware(next http.Handler) http.Handler {
 		a.metrics.RecordAuthentication("bearer", true)
 
 		// Add identity and auth type to request context
-		ctx = auth.ContextWithIdentity(ctx, identity)
-		ctx = auth.ContextWithAuthType(ctx, auth.AuthTypeBearer)
+		ctx = contextutil.WithIdentity(ctx, identity)
+		ctx = contextutil.WithAuthType(ctx, auth.AuthTypeBearer)
 
 		// Continue with the next handler
 		next.ServeHTTP(w, r.WithContext(ctx))

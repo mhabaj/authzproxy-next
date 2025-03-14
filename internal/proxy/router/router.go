@@ -5,9 +5,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
-	"authzproxy/internal/auth"
 	"authzproxy/internal/authz"
+	"authzproxy/internal/contextutil"
 	"authzproxy/internal/observability/logging"
 	"authzproxy/internal/observability/metrics"
 
@@ -57,15 +58,46 @@ type Config struct {
 	// UpstreamURL is the URL of the upstream service
 	UpstreamURL *url.URL
 
+	// UpstreamTimeout is the timeout for upstream service requests
+	UpstreamTimeout time.Duration
+
 	// Rules is the list of routing rules
 	Rules []Rule
 }
 
 // New creates a new router
 func New(config Config, authorizer authz.Authorizer, logger *logging.Logger, metricsCollector *metrics.Collector) *Router {
+	// Create the reverse proxy with proper timeout configuration
+	target := httputil.NewSingleHostReverseProxy(config.UpstreamURL)
+
+	// Configure transport with timeouts
+	transport := &http.Transport{
+		ResponseHeaderTimeout: config.UpstreamTimeout,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	target.Transport = transport
+
+	// Set up upstream request metrics
+	target.ModifyResponse = func(resp *http.Response) error {
+		req := resp.Request
+		if req != nil {
+			startTime := time.Now().Add(-config.UpstreamTimeout) // Approximate start time
+			duration := time.Since(startTime)
+			metricsCollector.RecordUpstreamRequest(
+				req.Method,
+				config.UpstreamURL.String(),
+				resp.StatusCode,
+				duration,
+			)
+		}
+		return nil
+	}
+
 	r := &Router{
 		Router:      mux.NewRouter(),
-		target:      httputil.NewSingleHostReverseProxy(config.UpstreamURL),
+		target:      target,
 		authorizer:  authorizer,
 		rules:       config.Rules,
 		logger:      logger.WithModule("proxy.router"),
@@ -81,6 +113,10 @@ func New(config Config, authorizer authz.Authorizer, logger *logging.Logger, met
 
 // setupRoutes configures routes based on rules
 func (r *Router) setupRoutes() {
+	// Create reusable handlers
+	allowHandler := r.createAllowHandler()
+	denyHandler := r.createDenyHandler()
+
 	for _, rule := range r.rules {
 		r.logger.Debug("Setting up route",
 			"name", rule.Name,
@@ -101,19 +137,21 @@ func (r *Router) setupRoutes() {
 				route = route.Methods(rule.Methods...)
 			}
 
+			// Store rule data in route variables
+			route = route.Name(rule.Name)
+
 			switch rule.Action {
 			case "allow":
-				route.HandlerFunc(r.AllowHandler(rule))
+				route.Handler(allowHandler)
 			case "deny":
-				route.HandlerFunc(r.DenyHandler(rule))
+				route.Handler(denyHandler)
 			case "auth":
-				route.HandlerFunc(r.AuthHandler(rule))
+				// Auth handler needs permission, so we create a specific handler
+				route.Handler(r.createAuthHandlerForRule(rule))
 			default:
 				r.logger.Warn("Unknown action in rule, defaulting to deny",
-					"rule", rule.Name,
-					"action", rule.Action,
-				)
-				route.HandlerFunc(r.DenyHandler(rule))
+					"rule", rule.Name, "action", rule.Action)
+				route.Handler(denyHandler)
 			}
 		}
 	}
@@ -133,9 +171,13 @@ func (r *Router) setupRoutes() {
 	})
 }
 
-// AllowHandler creates a handler that allows all requests
-func (r *Router) AllowHandler(rule Rule) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
+// createAllowHandler creates a reusable handler for "allow" rules
+func (r *Router) createAllowHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Get the rule name from the route
+		route := mux.CurrentRoute(req)
+		ruleName := route.GetName()
+
 		// Get logger from context
 		ctx := req.Context()
 		logger := logging.LoggerFromContext(ctx)
@@ -144,22 +186,36 @@ func (r *Router) AllowHandler(rule Rule) http.HandlerFunc {
 		}
 
 		logger.Debug("Allow handler called",
-			"rule", rule.Name,
+			"rule", ruleName,
 			"path", req.URL.Path,
 			"method", req.Method,
 		)
 
 		// Record metrics
-		r.metrics.RecordRuleMatch(rule.Name, "allow")
+		r.metrics.RecordRuleMatch(ruleName, "allow")
 
-		// Proxy the request to the upstream service
-		r.target.ServeHTTP(w, req)
-	}
+		// Start time for measuring upstream request duration
+		startTime := time.Now()
+
+		// Create a response writer wrapper to capture status
+		wrapper := newResponseWrapper(w)
+
+		// Proxy to upstream
+		r.target.ServeHTTP(wrapper, req)
+
+		// Record metrics
+		duration := time.Since(startTime)
+		r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.statusCode, duration)
+	})
 }
 
-// DenyHandler creates a handler that denies all requests
-func (r *Router) DenyHandler(rule Rule) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
+// createDenyHandler creates a reusable handler for "deny" rules
+func (r *Router) createDenyHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Get the rule name from the route
+		route := mux.CurrentRoute(req)
+		ruleName := route.GetName()
+
 		// Get logger from context
 		ctx := req.Context()
 		logger := logging.LoggerFromContext(ctx)
@@ -168,22 +224,22 @@ func (r *Router) DenyHandler(rule Rule) http.HandlerFunc {
 		}
 
 		logger.Debug("Deny handler called",
-			"rule", rule.Name,
+			"rule", ruleName,
 			"path", req.URL.Path,
 			"method", req.Method,
 		)
 
 		// Record metrics
-		r.metrics.RecordRuleMatch(rule.Name, "deny")
+		r.metrics.RecordRuleMatch(ruleName, "deny")
 
 		http.Error(w, "Forbidden", http.StatusForbidden)
-	}
+	})
 }
 
-// AuthHandler creates a handler that authorizes requests
-func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		// Get logger from context
+// createAuthHandlerForRule creates a handler for a specific "auth" rule
+func (r *Router) createAuthHandlerForRule(rule Rule) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Context and logging setup
 		ctx := req.Context()
 		logger := logging.LoggerFromContext(ctx)
 		if logger == nil {
@@ -192,22 +248,22 @@ func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
 
 		logger.Debug("Auth handler called",
 			"rule", rule.Name,
+			"permission", rule.Permission,
 			"path", req.URL.Path,
 			"method", req.Method,
-			"permission", rule.Permission,
 		)
 
-		// Get the identity from the context
-		identity := auth.IdentityFromContext(ctx)
+		// Get identity and authorize
+		identity := contextutil.GetIdentity(ctx)
 		if identity == nil {
-			logger.Info("Auth failed: no identity in context", "rule", rule.Name)
+			logger.Info("Auth failed: no identity", "rule", rule.Name)
 			r.metrics.RecordAuthorization(rule.Permission, false)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
 		// Create authorization request
-		authReq := &authz.Request{
+		authzReq := &authz.Request{
 			Identity:   identity,
 			Permission: rule.Permission,
 			Resource:   rule.Resource,
@@ -215,7 +271,7 @@ func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
 		}
 
 		// Check authorization
-		resp := r.authorizer.Authorize(authReq)
+		resp := r.authorizer.Authorize(authzReq)
 
 		// Record metrics
 		r.metrics.RecordRuleMatch(rule.Name, "auth")
@@ -229,7 +285,20 @@ func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
 				"rule", rule.Name,
 			)
 			r.metrics.RecordAuthorization(rule.Permission, true)
-			r.target.ServeHTTP(w, req)
+
+			// Start time for measuring upstream request duration
+			startTime := time.Now()
+
+			// Create a response writer wrapper to capture status
+			wrapper := newResponseWrapper(w)
+
+			// Proxy to upstream
+			r.target.ServeHTTP(wrapper, req)
+
+			// Record metrics
+			duration := time.Since(startTime)
+			r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.statusCode, duration)
+
 		case authz.Deny:
 			logger.Info("Authorization failed: permission denied",
 				"subject", identity.Subject,
@@ -238,10 +307,12 @@ func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
 			)
 			r.metrics.RecordAuthorization(rule.Permission, false)
 			http.Error(w, "Forbidden", http.StatusForbidden)
+
 		case authz.Unauthorized:
 			logger.Info("Authorization failed: unauthorized", "rule", rule.Name)
 			r.metrics.RecordAuthorization(rule.Permission, false)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+
 		case authz.Error:
 			logger.Error("Authorization failed: error",
 				logging.Err(resp.Error),
@@ -252,5 +323,22 @@ func (r *Router) AuthHandler(rule Rule) http.HandlerFunc {
 			// This matches the original SpiceDB authorizer implementation
 			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		}
-	}
+	})
+}
+
+// responseWrapper is a wrapper for http.ResponseWriter that captures status code
+type responseWrapper struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// newResponseWrapper creates a new response wrapper
+func newResponseWrapper(w http.ResponseWriter) *responseWrapper {
+	return &responseWrapper{ResponseWriter: w, statusCode: http.StatusOK}
+}
+
+// WriteHeader captures the status code before passing to the underlying ResponseWriter
+func (rw *responseWrapper) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
