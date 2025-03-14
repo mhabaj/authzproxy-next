@@ -14,6 +14,9 @@ import (
 	tlsconfig "authzproxy/internal/tls"
 
 	"github.com/authzed/authzed-go/v1"
+	"github.com/authzed/grpcutil"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // NewFromConfig creates a new server from configuration
@@ -69,8 +72,9 @@ func NewFromConfig(cfg *config.Config) (*Server, error) {
 
 	// Initialize router
 	routerConfig := router.Config{
-		UpstreamURL: cfg.Upstream.URL,
-		Rules:       routerRules,
+		UpstreamURL:     cfg.Upstream.URL,
+		UpstreamTimeout: cfg.Upstream.Timeout,
+		Rules:           routerRules,
 	}
 	proxyRouter := router.New(routerConfig, authorizer, logger, obs.Metrics)
 
@@ -119,14 +123,36 @@ func convertRules(configRules []config.Rule) []router.Rule {
 
 // createSpiceDBClient creates a SpiceDB client
 func createSpiceDBClient(cfg *config.Config, logger *logging.Logger) (*authzed.Client, error) {
-	// Implementation connecting to SpiceDB using the config.Authz.SpiceDB fields
-	// This would typically use a client library to connect to SpiceDB
+	endpoint := cfg.Authz.SpiceDB.Endpoint
+	token := cfg.Authz.SpiceDB.Token
+	insecureConn := cfg.Authz.SpiceDB.Insecure // Renamed variable to avoid conflict
 
-	// For this example, we'll just return nil with a helpful log message
-	logger.Info("Would create SpiceDB client",
-		"endpoint", cfg.Authz.SpiceDB.Endpoint,
-		"insecure", cfg.Authz.SpiceDB.Insecure)
+	var opts []grpc.DialOption
 
-	// In a real implementation, this would return an actual client
-	return nil, nil
+	if insecureConn {
+		logger.Warn("Connecting to SpiceDB without TLS")
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		opts = append(opts, grpcutil.WithInsecureBearerToken(token))
+	} else {
+		opts = append(opts, grpcutil.WithBearerToken(token))
+
+		// Use system certificates by default
+		logger.Debug("Using system certificates for SpiceDB")
+		systemCertsOpt, err := grpcutil.WithSystemCerts(grpcutil.VerifyCA)
+		if err != nil {
+			logger.Error("Failed to load system certificates", logging.Err(err))
+			return nil, fmt.Errorf("failed to load system certificates: %w", err)
+		}
+		opts = append(opts, systemCertsOpt)
+	}
+
+	logger.Info("Creating SpiceDB client", "endpoint", endpoint)
+	client, err := authzed.NewClient(endpoint, opts...)
+	if err != nil {
+		logger.Error("Failed to create SpiceDB client", logging.Err(err))
+		return nil, fmt.Errorf("failed to create SpiceDB client: %w", err)
+	}
+
+	logger.Debug("SpiceDB client created successfully")
+	return client, nil
 }

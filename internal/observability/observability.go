@@ -1,3 +1,4 @@
+// internal/observability/observability.go
 package observability
 
 import (
@@ -5,6 +6,7 @@ import (
 	"time"
 
 	"authzproxy/internal/config"
+	"authzproxy/internal/httputils"
 	"authzproxy/internal/observability/logging"
 	"authzproxy/internal/observability/metrics"
 )
@@ -53,7 +55,7 @@ func (p *Provider) Middleware(next http.Handler) http.Handler {
 		ctx = logging.ContextWithLogger(ctx, logger)
 
 		// Create a response wrapper to capture the status code
-		wrapper := newResponseWrapper(w)
+		wrapper := httputils.NewResponseWriter(w)
 
 		// Add trace information to response headers
 		wrapper.Header().Set("X-Trace-ID", traceID)
@@ -76,14 +78,15 @@ func (p *Provider) Middleware(next http.Handler) http.Handler {
 		duration := time.Since(startTime)
 
 		// Record metrics
-		p.Metrics.RecordRequest(r.Method, r.URL.Path, wrapper.statusCode, duration)
+		p.Metrics.RecordRequest(r.Method, r.URL.Path, wrapper.StatusCode, duration)
 
 		// Log the completed request
 		logger.Info("Request completed",
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", wrapper.statusCode,
+			"status", wrapper.StatusCode,
 			"duration_ms", duration.Milliseconds(),
+			"bytes_written", wrapper.BytesWritten,
 		)
 	})
 }
@@ -109,7 +112,7 @@ func (p *Provider) HTTPHandler(h http.HandlerFunc) http.HandlerFunc {
 		ctx = logging.ContextWithLogger(ctx, logger)
 
 		// Create response wrapper
-		wrapper := newResponseWrapper(w)
+		wrapper := httputils.NewResponseWriter(w)
 		wrapper.Header().Set("X-Trace-ID", traceID)
 
 		// Update request with new context
@@ -120,25 +123,8 @@ func (p *Provider) HTTPHandler(h http.HandlerFunc) http.HandlerFunc {
 
 		// Record metrics
 		duration := time.Since(startTime)
-		p.Metrics.RecordRequest(r.Method, r.URL.Path, wrapper.statusCode, duration)
+		p.Metrics.RecordRequest(r.Method, r.URL.Path, wrapper.StatusCode, duration)
 	}
-}
-
-// responseWrapper is a wrapper for http.ResponseWriter that captures the status code
-type responseWrapper struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-// newResponseWrapper creates a new response wrapper
-func newResponseWrapper(w http.ResponseWriter) *responseWrapper {
-	return &responseWrapper{ResponseWriter: w, statusCode: http.StatusOK}
-}
-
-// WriteHeader captures the status code and passes it to the underlying ResponseWriter
-func (rw *responseWrapper) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
 }
 
 // MetricsHandler returns an HTTP handler for exposing metrics

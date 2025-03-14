@@ -130,3 +130,23 @@ func EnrichContext(ctx context.Context, logger *logging.Logger) context.Context 
 
 	return ctx
 }
+
+// For backward compatibility with code using auth package directly
+func IdentityFromContext(ctx context.Context) *auth.Identity {
+	return GetIdentity(ctx)
+}
+
+// For backward compatibility with code using auth package directly
+func ContextWithIdentity(ctx context.Context, identity *auth.Identity) context.Context {
+	return WithIdentity(ctx, identity)
+}
+
+// For backward compatibility with code using auth package directly
+func AuthTypeFromContext(ctx context.Context) auth.AuthType {
+	return GetAuthType(ctx)
+}
+
+// For backward compatibility with code using auth package directly
+func ContextWithAuthType(ctx context.Context, authType auth.AuthType) context.Context {
+	return WithAuthType(ctx, authType)
+}

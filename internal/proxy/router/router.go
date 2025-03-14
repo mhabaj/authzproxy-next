@@ -2,6 +2,7 @@
 package router
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 
 	"authzproxy/internal/authz"
 	"authzproxy/internal/contextutil"
+	"authzproxy/internal/httputils"
 	"authzproxy/internal/observability/logging"
 	"authzproxy/internal/observability/metrics"
 
@@ -51,6 +53,7 @@ type Router struct {
 	logger      *logging.Logger
 	metrics     *metrics.Collector
 	upstreamURL *url.URL
+	startTime   time.Time
 }
 
 // Config holds router configuration
@@ -63,6 +66,14 @@ type Config struct {
 
 	// Rules is the list of routing rules
 	Rules []Rule
+}
+
+// HealthStatus represents the health status of the proxy
+type HealthStatus struct {
+	Status    string `json:"status"`
+	Uptime    string `json:"uptime"`
+	Timestamp string `json:"timestamp"`
+	Version   string `json:"version,omitempty"`
 }
 
 // New creates a new router
@@ -103,6 +114,7 @@ func New(config Config, authorizer authz.Authorizer, logger *logging.Logger, met
 		logger:      logger.WithModule("proxy.router"),
 		metrics:     metricsCollector,
 		upstreamURL: config.UpstreamURL,
+		startTime:   time.Now(),
 	}
 
 	// Set up the routes
@@ -113,6 +125,14 @@ func New(config Config, authorizer authz.Authorizer, logger *logging.Logger, met
 
 // setupRoutes configures routes based on rules
 func (r *Router) setupRoutes() {
+	// Add health check endpoint
+	r.Path("/health").Methods("GET").HandlerFunc(r.healthCheckHandler)
+	r.Path("/healthz").Methods("GET").HandlerFunc(r.healthCheckHandler) // Common alternative path
+
+	// Add readiness check endpoint
+	r.Path("/ready").Methods("GET").HandlerFunc(r.readinessCheckHandler)
+	r.Path("/readyz").Methods("GET").HandlerFunc(r.readinessCheckHandler) // Common alternative path
+
 	// Create reusable handlers
 	allowHandler := r.createAllowHandler()
 	denyHandler := r.createDenyHandler()
@@ -156,6 +176,18 @@ func (r *Router) setupRoutes() {
 		}
 	}
 
+	// Add version endpoint
+	r.Path("/version").Methods("GET").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		version := struct {
+			Version string `json:"version"`
+		}{
+			Version: "1.0.0", // This should be pulled from a version package
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(version)
+	})
+
 	// Add root handler for diagnostic purposes
 	r.Path("/").Methods("GET").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.logger.Info("Root path accessed")
@@ -169,6 +201,36 @@ func (r *Router) setupRoutes() {
 		r.metrics.RecordRequest(req.Method, req.URL.Path, http.StatusNotFound, 0)
 		http.Error(w, "404 page not found", http.StatusNotFound)
 	})
+}
+
+// healthCheckHandler handles health check requests
+func (r *Router) healthCheckHandler(w http.ResponseWriter, req *http.Request) {
+	status := HealthStatus{
+		Status:    "ok",
+		Uptime:    time.Since(r.startTime).String(),
+		Timestamp: time.Now().Format(time.RFC3339),
+		Version:   "1.0.0", // Should be from version package
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// readinessCheckHandler handles readiness check requests
+// In a more complex application, this would check dependent services
+func (r *Router) readinessCheckHandler(w http.ResponseWriter, req *http.Request) {
+	// Check if the upstream service is available
+	// For simplicity, we just return OK, but in a real implementation
+	// we would check dependent services like SpiceDB
+
+	status := struct {
+		Status string `json:"status"`
+	}{
+		Status: "ready",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
 
 // createAllowHandler creates a reusable handler for "allow" rules
@@ -198,14 +260,14 @@ func (r *Router) createAllowHandler() http.Handler {
 		startTime := time.Now()
 
 		// Create a response writer wrapper to capture status
-		wrapper := newResponseWrapper(w)
+		wrapper := httputils.NewResponseWriter(w)
 
 		// Proxy to upstream
 		r.target.ServeHTTP(wrapper, req)
 
 		// Record metrics
 		duration := time.Since(startTime)
-		r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.statusCode, duration)
+		r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.StatusCode, duration)
 	})
 }
 
@@ -290,14 +352,14 @@ func (r *Router) createAuthHandlerForRule(rule Rule) http.Handler {
 			startTime := time.Now()
 
 			// Create a response writer wrapper to capture status
-			wrapper := newResponseWrapper(w)
+			wrapper := httputils.NewResponseWriter(w)
 
 			// Proxy to upstream
 			r.target.ServeHTTP(wrapper, req)
 
 			// Record metrics
 			duration := time.Since(startTime)
-			r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.statusCode, duration)
+			r.metrics.RecordUpstreamRequest(req.Method, r.upstreamURL.String(), wrapper.StatusCode, duration)
 
 		case authz.Deny:
 			logger.Info("Authorization failed: permission denied",
@@ -324,21 +386,4 @@ func (r *Router) createAuthHandlerForRule(rule Rule) http.Handler {
 			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		}
 	})
-}
-
-// responseWrapper is a wrapper for http.ResponseWriter that captures status code
-type responseWrapper struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-// newResponseWrapper creates a new response wrapper
-func newResponseWrapper(w http.ResponseWriter) *responseWrapper {
-	return &responseWrapper{ResponseWriter: w, statusCode: http.StatusOK}
-}
-
-// WriteHeader captures the status code before passing to the underlying ResponseWriter
-func (rw *responseWrapper) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
 }
